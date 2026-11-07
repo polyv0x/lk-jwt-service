@@ -31,6 +31,7 @@ type ExchangeOpenIdUserInfoFn =
 type ResolveCsApiUrl = Box<dyn Fn(&str) -> Result<CsApiUrl, String> + Send + Sync>;
 type CreateLiveKitRoomFn =
     Box<dyn Fn(&LiveKitRoomAlias, &str, &LiveKitIdentity) -> Result<(), String> + Send + Sync>;
+type LiveKitRoomExistsFn = Box<dyn Fn(&LiveKitRoomAlias) -> Result<bool, String> + Send + Sync>;
 type ParticipantExistsFn = Box<
     dyn Fn(&LiveKitRoomAlias, &LiveKitIdentity) -> BoxFuture<'static, Result<bool, String>>
         + Send
@@ -57,6 +58,7 @@ struct HandlerTestDeps {
     exchange_openid_userinfo_fn: Option<ExchangeOpenIdUserInfoFn>,
     resolve_cs_api_url_fn: Option<ResolveCsApiUrl>,
     create_livekit_room_fn: Option<CreateLiveKitRoomFn>,
+    livekit_room_exists_fn: Option<LiveKitRoomExistsFn>,
     participant_exists_fn: Option<ParticipantExistsFn>,
     execute_delayed_event_action_fn: Option<ExecuteDelayedEventActionFn>,
     get_delayed_event_delay_fn: Option<GetDelayedEventDelayFn>,
@@ -66,6 +68,16 @@ struct HandlerTestDeps {
 
 #[async_trait::async_trait]
 impl Deps for HandlerTestDeps {
+    async fn livekit_room_exists(
+        &self,
+        _auth: &LiveKitAuth,
+        room: &LiveKitRoomAlias,
+    ) -> Result<bool, String> {
+        self.livekit_room_exists_fn
+            .as_ref()
+            .expect("livekit_room_exists not mocked in HandlerTestDeps")(room)
+    }
+
     fn new_room_service_client(
         &self,
         _url: &str,
@@ -5039,6 +5051,13 @@ fn membership_deps(
     let lookup_probe = probe.clone();
     HandlerTestDeps {
         exchange_openid_userinfo_fn: exchange_openid_userinfo_ok(sub),
+        livekit_room_exists_fn: Some(Box::new(|room| {
+            assert_eq!(
+                *room,
+                livekit_room_alias_for(MEMBERSHIP_ROOM, "m.call#ROOM")
+            );
+            Ok(true)
+        })),
         create_livekit_room_fn: Some(Box::new(move |_, _, _| {
             room_probe.rooms_created.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -5317,18 +5336,38 @@ async fn test_membership_checks_restricted_user_against_configured_homeserver() 
         true,
         &["example.com"],
     );
-    handler
+    let response = handler
         .process_legacy_sfu_request(&membership_legacy_request("other.com", MEMBERSHIP_ROOM))
         .await
         .expect("expected success");
+    let claims = parse_jwt_claims(&response.jwt, "secret");
+    assert_eq!(claims["video"]["canPublish"], true);
+    assert_eq!(claims["video"]["roomCreate"], false);
+    assert_eq!(claims["video"]["canSubscribe"], true);
+    assert_eq!(claims["video"]["roomJoin"], true);
+    assert_ne!(claims["video"]["roomAdmin"], true);
+    assert_ne!(claims["video"]["roomList"], true);
+    assert_eq!(claims["sub"], "@user:other.com:device-id");
+    assert_eq!(
+        claims["video"]["room"],
+        livekit_room_alias_for(MEMBERSHIP_ROOM, "m.call#ROOM").0
+    );
+    assert_eq!(probe.rooms_created.load(Ordering::SeqCst), 0);
     let args = probe.is_joined_args.lock().unwrap().clone();
     assert_eq!(
         args,
-        vec![(
-            "https://matrix.example.com".to_owned(),
-            MEMBERSHIP_ROOM.to_owned(),
-            "@user:other.com".to_owned()
-        )],
+        vec![
+            (
+                "https://matrix.example.com".to_owned(),
+                MEMBERSHIP_ROOM.to_owned(),
+                "@user:other.com".to_owned()
+            ),
+            (
+                "https://matrix.example.com".to_owned(),
+                MEMBERSHIP_ROOM.to_owned(),
+                "example.com".to_owned()
+            )
+        ],
         "membership must be asked of hs_server_name for the remote user"
     );
     handler.close().await;
@@ -5402,4 +5441,115 @@ async fn test_membership_skipped_unless_hs_is_the_only_full_access_homeserver() 
         assert_eq!(probe.is_joined_calls(), 0, "{endpoint:?}: is_joined calls");
         handler.close().await;
     }
+}
+
+// Legacy guest policy: no unverified publishing or guest room creation.
+#[tokio::test]
+async fn test_legacy_guest_denials_do_not_create_calls() {
+    for (name, user_joined, server_joined, call_exists, status) in [
+        ("unjoined user", Ok(false), Ok(true), Ok(true), 403),
+        (
+            "membership unavailable",
+            Err("membership unavailable"),
+            Ok(true),
+            Ok(true),
+            502,
+        ),
+        ("local server left", Ok(true), Ok(false), Ok(true), 403),
+        (
+            "local membership unavailable",
+            Ok(true),
+            Err("membership unavailable"),
+            Ok(true),
+            502,
+        ),
+        ("no existing call", Ok(true), Ok(true), Ok(false), 403),
+        (
+            "SFU unavailable",
+            Ok(true),
+            Ok(true),
+            Err("SFU unavailable"),
+            502,
+        ),
+    ] {
+        let probe = Arc::new(MembershipProbe::default());
+        let mut deps = membership_deps(&probe, "@guest:other.com", Membership::Joined);
+        deps.is_joined_fn = Some(Box::new(move |url, room, subject| {
+            assert_eq!(url.as_str(), "https://matrix.example.com");
+            assert_eq!(room, MEMBERSHIP_ROOM);
+            match subject {
+                JoinedSubject::User(id) => {
+                    assert_eq!(id, "@guest:other.com");
+                    user_joined.map_err(str::to_owned)
+                }
+                JoinedSubject::Server(server) => {
+                    assert_eq!(server, "example.com");
+                    assert_eq!(user_joined, Ok(true), "check the user first");
+                    server_joined.map_err(str::to_owned)
+                }
+            }
+        }));
+        deps.livekit_room_exists_fn = Some(Box::new(move |room| {
+            assert_eq!(user_joined, Ok(true));
+            assert_eq!(server_joined, Ok(true));
+            assert_eq!(
+                *room,
+                livekit_room_alias_for(MEMBERSHIP_ROOM, "m.call#ROOM")
+            );
+            call_exists.map_err(str::to_owned)
+        }));
+        let handler = new_membership_handler(deps, true, &["example.com"]);
+        let result = handler
+            .process_legacy_sfu_request(&membership_legacy_request("other.com", MEMBERSHIP_ROOM))
+            .await;
+        let err = result.expect_err(name);
+        assert_eq!(err.status, status, "{name}");
+        assert_eq!(probe.rooms_created.load(Ordering::SeqCst), 0, "{name}");
+        handler.close().await;
+    }
+}
+
+#[tokio::test]
+async fn test_legacy_guest_without_safe_membership_configuration_stays_restricted() {
+    for (app_service, full_access) in [
+        (false, vec!["example.com"]),
+        (true, vec!["example.com", "second.example.com"]),
+        (true, vec!["second.example.com"]),
+    ] {
+        // Unmocked membership and SFU operations panic if called.
+        let deps = HandlerTestDeps {
+            exchange_openid_userinfo_fn: exchange_openid_userinfo_ok("@guest:other.com"),
+            ..Default::default()
+        };
+        let handler = new_membership_handler(deps, app_service, &full_access);
+        let response = handler
+            .process_legacy_sfu_request(&membership_legacy_request("other.com", MEMBERSHIP_ROOM))
+            .await
+            .expect("upstream restricted mode");
+        let claims = parse_jwt_claims(&response.jwt, "secret");
+        assert_eq!(claims["video"]["canPublish"], false);
+        assert_eq!(claims["video"]["roomCreate"], false);
+        handler.close().await;
+    }
+}
+
+#[tokio::test]
+async fn test_legacy_guest_cannot_delegate_delayed_events() {
+    let handler = new_membership_handler(
+        HandlerTestDeps {
+            exchange_openid_userinfo_fn: exchange_openid_userinfo_ok("@guest:other.com"),
+            ..Default::default()
+        },
+        true,
+        &["example.com"],
+    );
+    let mut request = membership_legacy_request("other.com", MEMBERSHIP_ROOM);
+    request.delay_id = "delay".into();
+    request.delay_timeout = 1000;
+    let err = handler
+        .process_legacy_sfu_request(&request)
+        .await
+        .unwrap_err();
+    assert_eq!(err.status, 400);
+    handler.close().await;
 }

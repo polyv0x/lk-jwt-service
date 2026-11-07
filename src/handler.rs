@@ -974,11 +974,44 @@ impl Handler {
         let slot_id = "m.call#ROOM";
         let lk_room_alias = livekit_room_alias_for(&req.room, slot_id);
 
+        // Membership verification is enabled only when the AS is configured and
+        // the local homeserver alone can create calls. Never elevate guests in
+        // standalone mode or with a broader full-access list.
+        let is_verified_guest = !is_full_access_user && self.verifies_legacy_membership;
+        if is_verified_guest {
+            let cs_api_url = self
+                .resolve_cs_api_url_or_bad_request(&self.app_service_config.hs_server_name)
+                .await?;
+            self.require_joined(
+                &cs_api_url,
+                &req.room,
+                JoinedSubject::Server(&self.app_service_config.hs_server_name),
+                "The local homeserver is not joined to the room",
+            )
+            .await?;
+            let exists = self
+                .deps
+                .livekit_room_exists(&self.livekit_auth, &lk_room_alias)
+                .await
+                .map_err(|_| MatrixErrorResponse {
+                    status: 502,
+                    errcode: "M_UNKNOWN".into(),
+                    err: "Unable to verify the existing call".into(),
+                })?;
+            if !exists {
+                return Err(MatrixErrorResponse {
+                    status: 403,
+                    errcode: "M_FORBIDDEN".into(),
+                    err: "A local user must start the call first".into(),
+                });
+            }
+        }
+
         let token = self.get_join_token_or_internal_error(
             &lk_room_alias,
             &lk_identity,
             &matrix_id,
-            is_full_access_user,
+            is_full_access_user || is_verified_guest,
         )?;
 
         if is_full_access_user {
@@ -1014,7 +1047,7 @@ impl Handler {
         }
 
         info!(matrix_id = %matrix_id, claimed_device_id = %req.device_id,
-            access = if is_full_access_user { "full" } else { "restricted" },
+            access = if is_full_access_user { "full" } else if is_verified_guest { "verified_guest" } else { "restricted" },
             matrix_room = %req.room, lk_id = %lk_identity, room = %lk_room_alias,
             "Handler: generated Legacy SFU access token");
 

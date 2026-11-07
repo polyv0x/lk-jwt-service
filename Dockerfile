@@ -1,4 +1,4 @@
-FROM docker.io/rust:1-alpine AS builder
+FROM docker.io/rust:1.99.1-alpine AS builder
 
 WORKDIR /proj
 

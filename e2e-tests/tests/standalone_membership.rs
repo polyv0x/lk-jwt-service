@@ -432,3 +432,94 @@ async fn membership_not_enforced_on_stack_b_delegate_delayed_leave_serves_non_me
         "expected an empty response object, got {body}"
     );
 }
+
+/// Exercise the exact legacy endpoint used by Element X 26.02.2 against
+/// two federated Synapse servers and a real LiveKit instance.
+#[tokio::test]
+async fn legacy_guest_can_publish_only_in_a_locally_started_shared_call() {
+    assert_stack_is_up();
+    let local = register_user(SYNAPSE_A_CS_API_URL, "host", "e2e-test-password").await;
+    let guest = register_user(SYNAPSE_B_CS_API_URL, "guest", "e2e-test-password").await;
+    let stranger = register_user(SYNAPSE_B_CS_API_URL, "stranger", "e2e-test-password").await;
+    let room = create_and_join_room(SYNAPSE_A_CS_API_URL, &local).await;
+    join_room_via(SYNAPSE_B_CS_API_URL, &guest, &room, SYNAPSE_A_SERVER_NAME).await;
+
+    // Even a joined guest cannot bootstrap a new call.
+    let (status, body) = sfu_get(AUTH_SERVICE_A_URL, SYNAPSE_B_CS_API_URL, &guest, &room).await;
+    assert_eq!(status.as_u16(), 403, "{body}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN");
+
+    let (status, body) = sfu_get(AUTH_SERVICE_A_URL, SYNAPSE_A_CS_API_URL, &local, &room).await;
+    let host_jwt = expect_jwt(status, &body);
+    let host =
+        lk_jwt_service_e2e_tests::LiveKitParticipant::connect(LIVEKIT_A_SFU_ADDR, &host_jwt).await;
+
+    // Another account on the same remote homeserver has no access.
+    let (status, body) = sfu_get(AUTH_SERVICE_A_URL, SYNAPSE_B_CS_API_URL, &stranger, &room).await;
+    assert_eq!(status.as_u16(), 403, "{body}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN");
+
+    let (status, body) = sfu_get(AUTH_SERVICE_A_URL, SYNAPSE_B_CS_API_URL, &guest, &room).await;
+    let jwt = expect_jwt(status, &body);
+    assert_livekit_guest_publishing(&jwt).await;
+    host.disconnect().await;
+}
+
+async fn assert_livekit_guest_publishing(jwt: &str) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let url = format!(
+        "ws://{LIVEKIT_A_SFU_ADDR}/rtc?access_token={jwt}&protocol=15&sdk=other&version=1.0.0&auto_subscribe=1"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("guest websocket");
+        loop {
+            let message = socket
+                .next()
+                .await
+                .expect("SFU response")
+                .expect("valid websocket frame");
+            match message {
+                Message::Binary(bytes) => {
+                    let response =
+                        <livekit_protocol::SignalResponse as prost::Message>::decode(&bytes[..])
+                            .unwrap();
+                    if let Some(livekit_protocol::signal_response::Message::Join(join)) =
+                        response.message
+                    {
+                        let permission = join
+                            .participant
+                            .expect("guest participant")
+                            .permission
+                            .expect("guest permission");
+                        assert!(
+                            permission.can_publish,
+                            "LiveKit must allow guest publishing"
+                        );
+                        assert!(permission.can_subscribe);
+                        let leave = livekit_protocol::SignalRequest {
+                            message: Some(livekit_protocol::signal_request::Message::Leave(
+                                livekit_protocol::LeaveRequest {
+                                    can_reconnect: false,
+                                    ..Default::default()
+                                },
+                            )),
+                        };
+                        socket
+                            .send(Message::binary(prost::Message::encode_to_vec(&leave)))
+                            .await
+                            .unwrap();
+                        socket.close(None).await.unwrap();
+                        break;
+                    }
+                }
+                Message::Close(_) => panic!("SFU rejected guest"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("guest join timeout");
+}

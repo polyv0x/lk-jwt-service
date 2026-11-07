@@ -286,6 +286,7 @@ pub enum RoomServiceError {
 #[async_trait]
 pub trait RoomServiceClient: Send + Sync {
     async fn create_room(&self, params: CreateRoomParams) -> Result<RoomInfo, RoomServiceError>;
+    async fn room_exists(&self, room: &str) -> Result<bool, RoomServiceError>;
     async fn get_participant(&self, room: &str, identity: &str) -> Result<(), RoomServiceError>;
 }
 
@@ -392,6 +393,25 @@ impl LiveKitRoomServiceClient {
 
 #[async_trait]
 impl RoomServiceClient for LiveKitRoomServiceClient {
+    async fn room_exists(&self, room: &str) -> Result<bool, RoomServiceError> {
+        let response: livekit_protocol::ListRoomsResponse = self
+            .twirp_call(
+                "ListRooms",
+                livekit_api::access_token::VideoGrants {
+                    room_list: true,
+                    ..Default::default()
+                },
+                livekit_protocol::ListRoomsRequest {
+                    names: vec![room.to_owned()],
+                },
+            )
+            .await?;
+        Ok(response
+            .rooms
+            .iter()
+            .any(|candidate| candidate.name == room))
+    }
+
     async fn create_room(&self, params: CreateRoomParams) -> Result<RoomInfo, RoomServiceError> {
         let room: livekit_protocol::Room = self
             .twirp_call(
@@ -567,6 +587,18 @@ impl std::fmt::Display for JoinedSubject<'_> {
 /// method implementations; tests override individual methods.
 #[async_trait]
 pub trait Deps: Send + Sync {
+    /// Inspect a room without creating it. Guests must never use CreateRoom.
+    async fn livekit_room_exists(
+        &self,
+        auth: &LiveKitAuth,
+        room: &LiveKitRoomAlias,
+    ) -> Result<bool, String> {
+        self.new_room_service_client(&auth.lk_url, &auth.key, &auth.secret)
+            .room_exists(&room.0)
+            .await
+            .map_err(|err| format!("could not check LiveKit room: {err}"))
+    }
+
     /// Whether outbound TLS connections skip certificate verification
     /// (LIVEKIT_INSECURE_SKIP_VERIFY_TLS). Honored by every HTTPS client the
     /// service creates.
@@ -2896,6 +2928,10 @@ mod tests {
 
     #[async_trait]
     impl RoomServiceClient for MockRoomServiceClient {
+        async fn room_exists(&self, _room: &str) -> Result<bool, RoomServiceError> {
+            panic!("room_exists not mocked in MockRoomServiceClient")
+        }
+
         async fn create_room(
             &self,
             params: CreateRoomParams,
@@ -3144,6 +3180,52 @@ mod tests {
 
     /// Captures one Twirp request (path + Authorization header) and returns a
     /// canned protobuf response.
+
+    #[tokio::test]
+    async fn test_guest_room_lookup_checks_exact_room_and_denies_errors() {
+        use prost::Message;
+        for (rooms, status, expected) in [
+            (vec!["target"], http::StatusCode::OK, Some(true)),
+            (vec!["unrelated"], http::StatusCode::OK, Some(false)),
+            (vec![], http::StatusCode::OK, Some(false)),
+            (vec!["target"], http::StatusCode::SERVICE_UNAVAILABLE, None),
+        ] {
+            let body = livekit_protocol::ListRoomsResponse {
+                rooms: rooms
+                    .into_iter()
+                    .map(|name| livekit_protocol::Room {
+                        name: name.to_owned(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            };
+            let (server, captured) = spawn_twirp_server(body.encode_to_vec(), status).await;
+            let auth = LiveKitAuth {
+                key: "test-key".into(),
+                secret: "test-secret".into(),
+                lk_url: format!("{}/livekit/sfu", server.url),
+            };
+            let result = RealDeps::default()
+                .livekit_room_exists(&auth, &LiveKitRoomAlias("target".into()))
+                .await;
+            match expected {
+                Some(exists) => assert_eq!(result.unwrap(), exists),
+                None => assert!(result.is_err()),
+            }
+            let (path, auth) = captured.lock().unwrap().clone();
+            assert_eq!(path, "/livekit/sfu/twirp/livekit.RoomService/ListRooms");
+            let claims = jsonwebtoken::decode::<serde_json::Value>(
+                auth.strip_prefix("Bearer ").unwrap(),
+                &jsonwebtoken::DecodingKey::from_secret(b"test-secret"),
+                &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256),
+            )
+            .unwrap()
+            .claims;
+            assert_eq!(claims["video"]["roomList"], true);
+            assert_eq!(claims["video"]["roomCreate"], false);
+        }
+    }
+
     async fn spawn_twirp_server(
         response: Vec<u8>,
         status: http::StatusCode,

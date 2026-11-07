@@ -2,7 +2,7 @@ networks:
   e2e:
 
 x-synapse-build: &synapse-build
-  image: matrixdotorg/synapse:develop
+  image: matrixdotorg/synapse:v1.164.2
 
 x-jwt-service-build: &jwt-service-build
   image: lk-jwt-e2e-jwt-service:latest
@@ -25,7 +25,7 @@ services:
       - ./certs/synapse-a.e2e.test.crt:/config/tls.crt:ro
       - ./certs/synapse-a.e2e.test.key:/config/tls.key:ro
     ports:
-      - "18008:8008"
+      - "127.0.0.1:18008:8008"
     networks:
       e2e:
         # Lets synapse-b resolve and federate with this homeserver by its
@@ -44,31 +44,31 @@ services:
       - ./certs/synapse-b.e2e.test.crt:/config/tls.crt:ro
       - ./certs/synapse-b.e2e.test.key:/config/tls.key:ro
     ports:
-      - "18009:8008"
+      - "127.0.0.1:18009:8008"
     networks:
       e2e:
         aliases:
           - synapse-b.e2e.test
 
   livekit-a:
-    image: livekit/livekit-server:latest
+    image: livekit/livekit-server:v1.9.11
     hostname: livekit-a
     command: --config /etc/livekit.yaml
     volumes:
       - ./livekit-a.yaml:/etc/livekit.yaml:ro
     ports:
-      - "17890:7880"
+      - "127.0.0.1:17890:7880"
     networks:
       - e2e
 
   livekit-b:
-    image: livekit/livekit-server:latest
+    image: livekit/livekit-server:v1.9.11
     hostname: livekit-b
     command: --config /etc/livekit.yaml
     volumes:
       - ./livekit-b.yaml:/etc/livekit.yaml:ro
     ports:
-      - "17891:7880"
+      - "127.0.0.1:17891:7880"
     networks:
       - e2e
 
@@ -90,7 +90,7 @@ services:
     volumes:
       - ./app-service-a.yaml:/etc/lk-jwt-service/app-service-a.yaml:ro
     ports:
-      - "18080:8080"
+      - "127.0.0.1:18080:8080"
     depends_on:
       - synapse-a
       - livekit-a
@@ -117,7 +117,7 @@ services:
     volumes:
       - ./app-service-b.yaml:/etc/lk-jwt-service/app-service-b.yaml:ro
     ports:
-      - "18081:8080"
+      - "127.0.0.1:18081:8080"
     depends_on:
       - synapse-b
       - livekit-b
